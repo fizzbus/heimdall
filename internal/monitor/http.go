@@ -50,12 +50,17 @@ func (s *Server) Start() error {
 
 // Stop корректно останавливает HTTP-сервер.
 func (s *Server) Stop() {
+	if s.srv == nil {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	s.srv.Shutdown(ctx)
-}
 
-// ── Обработчики ───────────────────────────────────────────────────────────────
+	if err := s.srv.Shutdown(ctx); err != nil {
+		log.Printf("[monitor] shutdown error: %v", err)
+	}
+}
 
 // GET /health
 // Возвращает статус брокера и текущее время.
@@ -69,6 +74,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status": "ok",
 		"time":   time.Now().UTC().Format(time.RFC3339),
 	}
+
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -105,9 +111,8 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Извлекаем имя топика из пути /topics/{name}
-	topicName := r.URL.Path[len("/topics/"):]
-	if topicName == "" {
+	topicName := strings.TrimPrefix(r.URL.Path, "/topics/")
+	if topicName == "" || topicName == r.URL.Path {
 		http.Error(w, "topic name required", http.StatusBadRequest)
 		return
 	}
@@ -123,29 +128,18 @@ func (s *Server) handleTopicDetail(w http.ResponseWriter, r *http.Request) {
 		NextOffset int64 `json:"next_offset"`
 	}
 
-	partitions := make([]partitionInfo, t.PartitionCount())
+	partitions := make([]partitionInfo, 0, t.PartitionCount())
 	for i := 0; i < t.PartitionCount(); i++ {
-		partitions[i] = partitionInfo{
+		partitions = append(partitions, partitionInfo{
 			ID:         i,
 			NextOffset: t.NextOffset(i),
-		}
+		})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name":       topicName,
 		"partitions": partitions,
 	})
-}
-
-// ── Вспомогательные функции ───────────────────────────────────────────────────
-
-// writeJSON сериализует v в JSON и отправляет ответ с заданным статусом.
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("[monitor] failed to write JSON response: %v", err)
-	}
 }
 
 // GET /metrics
@@ -157,7 +151,6 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
 
 	topics := s.broker.ListTopics()
 
@@ -165,10 +158,29 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	var messagesTotal int64
 	var bytesInTotal int64
 	var bytesOutTotal int64
-	var activeConnections int64 = 0 // если в broker нет счётчика, временно 0
+	var activeConnections int64
+
 	var sb strings.Builder
 
 	topicsTotal = len(topics)
+
+	sb.WriteString("# HELP broker_messages_in_total Total number of messages produced\n")
+	sb.WriteString("# TYPE broker_messages_in_total counter\n")
+
+	sb.WriteString("# HELP broker_bytes_in_total Total bytes received by broker\n")
+	sb.WriteString("# TYPE broker_bytes_in_total counter\n")
+
+	sb.WriteString("# HELP broker_bytes_out_total Total bytes sent by broker\n")
+	sb.WriteString("# TYPE broker_bytes_out_total counter\n")
+
+	sb.WriteString("# HELP broker_active_connections Current active TCP connections\n")
+	sb.WriteString("# TYPE broker_active_connections gauge\n")
+
+	sb.WriteString("# HELP broker_topics_total Number of topics in broker\n")
+	sb.WriteString("# TYPE broker_topics_total gauge\n")
+
+	sb.WriteString("# HELP consumer_group_lag Difference between high watermark and committed offset\n")
+	sb.WriteString("# TYPE consumer_group_lag gauge\n")
 
 	for _, topicName := range topics {
 		t, err := s.broker.GetTopic(topicName)
@@ -180,9 +192,6 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			nextOffset := t.NextOffset(p)
 			messagesTotal += nextOffset
 
-			// Для demo можно считать lag как 0, пока нет committed offsets в broker API.
-			// Если у тебя есть метод получения committed offset по group/topic/partition —
-			// подставь его сюда вместо нуля.
 			lag := int64(0)
 
 			sb.WriteString(fmt.Sprintf(
@@ -192,33 +201,23 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Для демо: bytes можно оценивать как 0, если брокер не хранит счётчики.
-	// Если у тебя есть реальные counters в broker, подставь их вместо этих значений.
-	sb.WriteString("# HELP broker_messages_in_total Total number of messages produced\n")
-	sb.WriteString("# TYPE broker_messages_in_total counter\n")
 	sb.WriteString(fmt.Sprintf("broker_messages_in_total %d\n", messagesTotal))
-
-	sb.WriteString("# HELP broker_bytes_in_total Total bytes received by broker\n")
-	sb.WriteString("# TYPE broker_bytes_in_total counter\n")
 	sb.WriteString(fmt.Sprintf("broker_bytes_in_total %d\n", bytesInTotal))
-
-	sb.WriteString("# HELP broker_bytes_out_total Total bytes sent by broker\n")
-	sb.WriteString("# TYPE broker_bytes_out_total counter\n")
 	sb.WriteString(fmt.Sprintf("broker_bytes_out_total %d\n", bytesOutTotal))
-
-	sb.WriteString("# HELP broker_active_connections Current active TCP connections\n")
-	sb.WriteString("# TYPE broker_active_connections gauge\n")
 	sb.WriteString(fmt.Sprintf("broker_active_connections %d\n", activeConnections))
-
-	sb.WriteString("# HELP broker_topics_total Number of topics in broker\n")
-	sb.WriteString("# TYPE broker_topics_total gauge\n")
 	sb.WriteString(fmt.Sprintf("broker_topics_total %d\n", topicsTotal))
 
-	sb.WriteString("# HELP consumer_group_lag Difference between high watermark and committed offset\n")
-	sb.WriteString("# TYPE consumer_group_lag gauge\n")
-
-	_, err := w.Write([]byte(sb.String()))
-	if err != nil {
+	if _, err := w.Write([]byte(sb.String())); err != nil {
 		log.Printf("[monitor] failed to write metrics response: %v", err)
+	}
+}
+
+// writeJSON сериализует v в JSON и отправляет ответ с заданным статусом.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("[monitor] failed to write JSON response: %v", err)
 	}
 }
