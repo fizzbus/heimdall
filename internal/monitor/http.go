@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"heimdall/internal/broker"
@@ -33,6 +34,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/topics", s.handleTopics)
 	mux.HandleFunc("/topics/", s.handleTopicDetail)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	s.srv = &http.Server{
 		Addr:         s.addr,
@@ -143,5 +145,80 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("[monitor] failed to write JSON response: %v", err)
+	}
+}
+
+// GET /metrics
+// Возвращает метрики в формате Prometheus text exposition 0.0.4.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	topics := s.broker.ListTopics()
+
+	var topicsTotal int
+	var messagesTotal int64
+	var bytesInTotal int64
+	var bytesOutTotal int64
+	var activeConnections int64 = 0 // если в broker нет счётчика, временно 0
+	var sb strings.Builder
+
+	topicsTotal = len(topics)
+
+	for _, topicName := range topics {
+		t, err := s.broker.GetTopic(topicName)
+		if err != nil {
+			continue
+		}
+
+		for p := 0; p < t.PartitionCount(); p++ {
+			nextOffset := t.NextOffset(p)
+			messagesTotal += nextOffset
+
+			// Для demo можно считать lag как 0, пока нет committed offsets в broker API.
+			// Если у тебя есть метод получения committed offset по group/topic/partition —
+			// подставь его сюда вместо нуля.
+			lag := int64(0)
+
+			sb.WriteString(fmt.Sprintf(
+				"consumer_group_lag{group=\"order-processors\",topic=%q,partition=\"%d\"} %d\n",
+				topicName, p, lag,
+			))
+		}
+	}
+
+	// Для демо: bytes можно оценивать как 0, если брокер не хранит счётчики.
+	// Если у тебя есть реальные counters в broker, подставь их вместо этих значений.
+	sb.WriteString("# HELP broker_messages_in_total Total number of messages produced\n")
+	sb.WriteString("# TYPE broker_messages_in_total counter\n")
+	sb.WriteString(fmt.Sprintf("broker_messages_in_total %d\n", messagesTotal))
+
+	sb.WriteString("# HELP broker_bytes_in_total Total bytes received by broker\n")
+	sb.WriteString("# TYPE broker_bytes_in_total counter\n")
+	sb.WriteString(fmt.Sprintf("broker_bytes_in_total %d\n", bytesInTotal))
+
+	sb.WriteString("# HELP broker_bytes_out_total Total bytes sent by broker\n")
+	sb.WriteString("# TYPE broker_bytes_out_total counter\n")
+	sb.WriteString(fmt.Sprintf("broker_bytes_out_total %d\n", bytesOutTotal))
+
+	sb.WriteString("# HELP broker_active_connections Current active TCP connections\n")
+	sb.WriteString("# TYPE broker_active_connections gauge\n")
+	sb.WriteString(fmt.Sprintf("broker_active_connections %d\n", activeConnections))
+
+	sb.WriteString("# HELP broker_topics_total Number of topics in broker\n")
+	sb.WriteString("# TYPE broker_topics_total gauge\n")
+	sb.WriteString(fmt.Sprintf("broker_topics_total %d\n", topicsTotal))
+
+	sb.WriteString("# HELP consumer_group_lag Difference between high watermark and committed offset\n")
+	sb.WriteString("# TYPE consumer_group_lag gauge\n")
+
+	_, err := w.Write([]byte(sb.String()))
+	if err != nil {
+		log.Printf("[monitor] failed to write metrics response: %v", err)
 	}
 }
