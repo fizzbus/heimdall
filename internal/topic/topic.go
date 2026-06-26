@@ -2,6 +2,11 @@ package topic
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 
 	"heimdall/config"
@@ -35,6 +40,58 @@ func New(name string, numPartitions int, cfg *config.Config) (*Topic, error) {
 			return nil, fmt.Errorf("failed to create partition %d: %w", i, err)
 		}
 		partitions[i] = p
+	}
+
+	return &Topic{
+		name:       name,
+		partitions: partitions,
+	}, nil
+}
+
+// Load восстанавливает топик из существующих директорий партиций на диске.
+// Сканирует DataDir/<name>/partition-N и загружает каждую партицию.
+func Load(name string, cfg *config.Config) (*Topic, error) {
+	topicDir := filepath.Join(cfg.DataDir, name)
+
+	entries, err := os.ReadDir(topicDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read topic dir %q: %w", topicDir, err)
+	}
+
+	// Собираем ID партиций из директорий вида partition-N
+	var partitionIDs []int
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "partition-") {
+			continue
+		}
+		idStr := strings.TrimPrefix(e.Name(), "partition-")
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			continue
+		}
+		partitionIDs = append(partitionIDs, id)
+	}
+
+	if len(partitionIDs) == 0 {
+		return nil, fmt.Errorf("no partitions found for topic %q", name)
+	}
+
+	sort.Ints(partitionIDs)
+
+	// Проверяем что IDs идут подряд от 0
+	for i, id := range partitionIDs {
+		if id != i {
+			return nil, fmt.Errorf("topic %q: missing partition %d", name, i)
+		}
+	}
+
+	partitions := make([]*Partition, len(partitionIDs))
+	for _, id := range partitionIDs {
+		p, err := NewPartition(name, id, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load partition %d: %w", id, err)
+		}
+		partitions[id] = p
 	}
 
 	return &Topic{

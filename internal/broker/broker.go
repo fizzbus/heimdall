@@ -2,6 +2,8 @@ package broker
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"sync"
 
 	"heimdall/config"
@@ -15,12 +17,41 @@ type Broker struct {
 	cfg    *config.Config
 }
 
-// New создаёт новый экземпляр брокера.
-func New(cfg *config.Config) *Broker {
-	return &Broker{
+// New создаёт брокер и восстанавливает топики с диска если они существуют.
+func New(cfg *config.Config) (*Broker, error) {
+	b := &Broker{
 		topics: make(map[string]*topic.Topic),
 		cfg:    cfg,
 	}
+	if err := b.loadFromDisk(); err != nil {
+		return nil, fmt.Errorf("failed to restore topics from disk: %w", err)
+	}
+	return b, nil
+}
+
+// loadFromDisk сканирует DataDir и восстанавливает все топики.
+func (b *Broker) loadFromDisk() error {
+	entries, err := os.ReadDir(b.cfg.DataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // чистый старт, ничего восстанавливать не нужно
+		}
+		return err
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		t, err := topic.Load(name, b.cfg)
+		if err != nil {
+			return fmt.Errorf("failed to load topic %q: %w", name, err)
+		}
+		b.topics[name] = t
+		log.Printf("[broker] restored topic %q (%d partitions)", name, t.PartitionCount())
+	}
+	return nil
 }
 
 // CreateTopic создаёт новый топик с заданным числом партиций.
@@ -89,7 +120,7 @@ func (b *Broker) Close() {
 	}
 }
 
-// GetTopic возвращает топик по имени или ошибку, если не найден.
+// GetTopic возвращает топик по имени или ошибку если не найден.
 func (b *Broker) GetTopic(name string) (*topic.Topic, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

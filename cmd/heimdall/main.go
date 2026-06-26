@@ -18,7 +18,10 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	b := broker.New(cfg)
+	b, err := broker.New(cfg)
+	if err != nil {
+		log.Fatalf("[broker] failed to start: %v", err)
+	}
 
 	tcpServer := network.NewServer(cfg.ListenAddr, b)
 	httpServer := monitor.NewServer(cfg.MonitorAddr, b)
