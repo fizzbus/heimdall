@@ -38,6 +38,7 @@ type Segment struct {
 
 	logSize    int64
 	nextOffset int64
+	closed     bool
 }
 
 // NewSegment создаёт новый сегмент с заданным базовым смещением.
@@ -87,7 +88,6 @@ func (s *Segment) Write(e Entry) error {
 
 	position := s.logSize
 
-	// Заголовок
 	header := make([]byte, headerSize)
 	binary.BigEndian.PutUint64(header[0:8], uint64(e.Offset))
 	binary.BigEndian.PutUint64(header[8:16], uint64(e.Timestamp))
@@ -109,7 +109,6 @@ func (s *Segment) Write(e Entry) error {
 
 	s.logSize += int64(headerSize + len(e.Key) + len(e.Value))
 
-	// Запись в индекс
 	if err := s.index.Append(e.Offset, position); err != nil {
 		return err
 	}
@@ -119,9 +118,16 @@ func (s *Segment) Write(e Entry) error {
 }
 
 // Read читает записи из сегмента начиная с offset, суммарно не более maxBytes.
+// Если сегмент был закрыт после ротации — автоматически переоткрывает его.
 func (s *Segment) Read(offset int64, maxBytes int) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.closed {
+		if err := s.reopen(); err != nil {
+			return nil, fmt.Errorf("failed to reopen segment %d: %w", s.baseOffset, err)
+		}
+	}
 
 	position, err := s.index.Lookup(offset)
 	if err != nil {
@@ -173,6 +179,37 @@ func (s *Segment) Read(offset int64, maxBytes int) ([]Entry, error) {
 	return entries, nil
 }
 
+// reopen переоткрывает файлы закрытого сегмента в режиме только для чтения.
+// Вызывается автоматически из Read при обращении к ротированному сегменту.
+func (s *Segment) reopen() error {
+	baseName := filepath.Join(s.dir, fmt.Sprintf("%020d", s.baseOffset))
+
+	logFile, err := os.OpenFile(baseName+".log", os.O_RDONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to reopen log: %w", err)
+	}
+
+	index, err := OpenIndex(baseName + ".index")
+	if err != nil {
+		logFile.Close()
+		return fmt.Errorf("failed to reopen index: %w", err)
+	}
+
+	info, err := logFile.Stat()
+	if err != nil {
+		logFile.Close()
+		index.Close()
+		return err
+	}
+
+	s.logFile = logFile
+	s.index = index
+	s.writer = bufio.NewWriterSize(logFile, 64*1024)
+	s.logSize = info.Size()
+	s.closed = false
+	return nil
+}
+
 // IsFull возвращает true, если лог-файл достиг максимального размера.
 func (s *Segment) IsFull() bool {
 	return s.logSize >= s.maxBytes
@@ -193,7 +230,7 @@ func (s *Segment) Dir() string {
 	return s.dir
 }
 
-// Close сбрасывает буфер и закрывает файлы.
+// Close сбрасывает буфер и закрывает файлы сегмента.
 func (s *Segment) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -204,7 +241,11 @@ func (s *Segment) Close() error {
 	if err := s.logFile.Close(); err != nil {
 		return err
 	}
-	return s.index.Close()
+	if err := s.index.Close(); err != nil {
+		return err
+	}
+	s.closed = true
+	return nil
 }
 
 // LoadSegments загружает все существующие сегменты из директории.

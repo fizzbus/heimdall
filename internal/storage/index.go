@@ -11,8 +11,9 @@ const entrySize = 16
 
 // Index управляет файлом смещений для одного сегмента.
 type Index struct {
-	file *os.File
-	size int64 // текущий размер файла в байтах
+	file   *os.File
+	size   int64
+	closed bool
 }
 
 // OpenIndex открывает или создаёт индексный файл по заданному пути.
@@ -92,16 +93,25 @@ func (idx *Index) LastOffset(baseOffset int64) int64 {
 	if err != nil {
 		return baseOffset
 	}
-	return idxOffset + 1 // следующее свободное смещение
+	return idxOffset + 1
+}
+
+// IsOpen возвращает true если файл индекса открыт.
+func (idx *Index) IsOpen() bool {
+	return !idx.closed
 }
 
 // Close закрывает файл индекса.
 func (idx *Index) Close() error {
+	idx.closed = true
 	return idx.file.Close()
 }
 
 // readAt читает запись индекса по порядковому номеру (не байтовой позиции).
 func (idx *Index) readAt(n int64) (offset int64, position int64, err error) {
+	if idx.closed {
+		return 0, 0, fmt.Errorf("index is closed")
+	}
 	buf := make([]byte, entrySize)
 	if _, err = idx.file.ReadAt(buf, n*entrySize); err != nil {
 		return 0, 0, fmt.Errorf("index read at %d failed: %w", n, err)
