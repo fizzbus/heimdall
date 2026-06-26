@@ -9,6 +9,9 @@ import (
 // entrySize — размер одной записи индекса в байтах: [offset:8][position:8]
 const entrySize = 16
 
+var ErrIndexEmpty = fmt.Errorf("index is empty")
+var ErrOffsetNotFound = fmt.Errorf("offset not found")
+
 // Index управляет файлом смещений для одного сегмента.
 type Index struct {
 	file   *os.File
@@ -54,7 +57,7 @@ func (idx *Index) Append(offset int64, position int64) error {
 func (idx *Index) Lookup(offset int64) (int64, error) {
 	count := idx.Count()
 	if count == 0 {
-		return 0, fmt.Errorf("index is empty")
+		return 0, ErrIndexEmpty
 	}
 
 	lo, hi := int64(0), count-1

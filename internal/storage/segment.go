@@ -131,6 +131,10 @@ func (s *Segment) Read(offset int64, maxBytes int) ([]Entry, error) {
 
 	position, err := s.index.Lookup(offset)
 	if err != nil {
+		// Индекс пустой — просто нет сообщений, не ошибка
+		if err.Error() == "index is empty" {
+			return nil, nil
+		}
 		return nil, err
 	}
 
